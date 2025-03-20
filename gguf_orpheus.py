@@ -12,10 +12,15 @@ import queue
 import asyncio
 
 # LM Studio API settings
-API_URL = "http://127.0.0.1:1234/v1/completions"
+# API_URL = "http://127.0.0.1:1234/v1/completions"
+API_URL = os.environ.get("API_URL", "http://127.0.0.1:1234/v1/chat/completions") 
+API_KEY = os.environ.get("API_KEY", "")
 HEADERS = {
     "Content-Type": "application/json"
 }
+if API_KEY:
+    HEADERS["Authorization"] = "Bearer "+API_KEY
+MODEL_NAME = os.environ.get("MODEL_NAME", "hf.co/isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF:latest")
 
 # Model parameters
 MAX_TOKENS = 1200
@@ -56,8 +61,12 @@ def generate_tokens_from_api(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATUR
     
     # Create the request payload for the LM Studio API
     payload = {
-        "model": "orpheus-3b-0.1-ft-q4_k_m",  # Model name can be anything, LM Studio ignores it
-        "prompt": formatted_prompt,
+        # Model name is used by endpoints such as those by OpenWebUI or OLLAMA
+        # LM Studio ignores it though.
+        "model": MODEL_NAME,
+        #"model": "orpheus-3b-0.1-ft-q4_k_m",  # Model name can be anything, LM Studio ignores it
+        #"prompt": formatted_prompt,
+        "messages": [{"role": "system", "content": [{"type": "text", "text": formatted_prompt}]}],
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
@@ -86,7 +95,8 @@ def generate_tokens_from_api(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATUR
                 try:
                     data = json.loads(data_str)
                     if 'choices' in data and len(data['choices']) > 0:
-                        token_text = data['choices'][0].get('text', '')
+                        # use the more modern "chat completions" API instead
+                        token_text = data['choices'][0].get('delta', {}).get('content', '')
                         token_counter += 1
                         if token_text:
                             yield token_text

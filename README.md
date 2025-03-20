@@ -1,6 +1,6 @@
 # Orpheus-TTS-Local
 
-A lightweight client for running [Orpheus TTS](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) locally using LM Studio API.
+A lightweight client for running [Orpheus TTS](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) locally using OpenAI compatible API (e.g. those served via LM Studio, Llama.cpp/Ollama, or OpenWebUI).
 
 ## Features
 
@@ -11,17 +11,23 @@ A lightweight client for running [Orpheus TTS](https://huggingface.co/canopylabs
 
 ## Quick Setup
 
-1. Install [LM Studio](https://lmstudio.ai/) 
-2. Download the [Orpheus TTS model (orpheus-3b-0.1-ft-q4_k_m.gguf)](https://huggingface.co/isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF) in LM Studio
-3. Load the Orpheus model in LM Studio
-4. Start the local server in LM Studio (default: http://127.0.0.1:1234)
-5. Install dependencies:
+1. Install [LM Studio](https://lmstudio.ai/), [Ollama](https://https://ollama.com/download), or [Llama.cpp's Server](https://github.com/ggml-org/llama.cpp)
+2. Download the [Orpheus TTS model (orpheus-3b-0.1-ft-q4_k_m.gguf)](https://huggingface.co/isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF) in your inference engine of choice
+  - For Ollama, do `ollama pull hf.co/isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF`
+3. Start up the model For LM Studio
+  - Load the Orpheus model in LM Studio
+  - Start the local server in LM Studio (default: http://127.0.0.1:1234)
+4. Install dependencies:
    ```
    python3 -m venv venv
    source venv/bin/activate
    pip install -r requirements.txt
    ```
-6. Run the script:
+5. (For OpenAI compatible endpoint users = Non-LM Studio) Set environment variables as needed
+  - export API_PATH=<your_server_url> (e.g. for Ollama, use http://localhost:11434/v1/chat/completions, for OpenWebUI, use http://your_server_url/api/chat/completions)
+  - export API_KEY=<your_api_key> (if you've set an API key to be required)
+  - export MODEL_NAME=<your_model_name> (if you've set a custom model name in your inference engine)
+5. Run the script:
    ```
    python gguf_orpheus.py --text "Hello, this is a test" --voice tara
    ```
