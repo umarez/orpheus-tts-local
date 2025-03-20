@@ -12,7 +12,8 @@ import queue
 import asyncio
 
 # LM Studio API settings
-API_URL = "http://127.0.0.1:1234/v1/completions"
+# API_URL = "http://127.0.0.1:1234/v1/completions"
+API_URL = "http://hpserver.local:3113/api/chat/completions"
 HEADERS = {
     "Content-Type": "application/json"
 }
@@ -56,8 +57,11 @@ def generate_tokens_from_api(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATUR
     
     # Create the request payload for the LM Studio API
     payload = {
-        "model": "orpheus-3b-0.1-ft-q4_k_m",  # Model name can be anything, LM Studio ignores it
-        "prompt": formatted_prompt,
+        # Model name is used by endpoints such as those by OpenWebUI or OLLAMA
+        "model": "hf.co/isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF:latest",
+        #"model": "orpheus-3b-0.1-ft-q4_k_m",  # Model name can be anything, LM Studio ignores it
+        #"prompt": formatted_prompt,
+        "messages": [{"role": "system", "content": [{"type": "text", "text": formatted_prompt}]}],
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
@@ -78,7 +82,9 @@ def generate_tokens_from_api(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATUR
     for line in response.iter_lines():
         if line:
             line = line.decode('utf-8')
+            print("line:"+line)
             if line.startswith('data: '):
+                print("gotline:"+line)
                 data_str = line[6:]  # Remove the 'data: ' prefix
                 if data_str.strip() == '[DONE]':
                     break
@@ -86,7 +92,8 @@ def generate_tokens_from_api(prompt, voice=DEFAULT_VOICE, temperature=TEMPERATUR
                 try:
                     data = json.loads(data_str)
                     if 'choices' in data and len(data['choices']) > 0:
-                        token_text = data['choices'][0].get('text', '')
+                        # use the more modern "chat completions" API instead
+                        token_text = data['choices'][0].get('delta', {}).get('content', '')
                         token_counter += 1
                         if token_text:
                             yield token_text
