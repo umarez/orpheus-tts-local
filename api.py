@@ -2,13 +2,15 @@ import os
 import uuid
 import shutil
 import boto3
+import json
+import asyncio
 from botocore.exceptions import NoCredentialsError, ClientError
-from fastapi import FastAPI, HTTPException, Query, Response, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Response, BackgroundTasks, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional
-from dotenv import load_dotenv # <-- Import load_dotenv
-from datetime import datetime, timezone # <-- Import datetime
+from typing import List, Optional, AsyncGenerator, Dict, Any
+from dotenv import load_dotenv
+from datetime import datetime, timezone
 
 # --- Load environment variables from .env file ---
 load_dotenv() # <-- Load variables from .env file into the environment
@@ -17,13 +19,13 @@ load_dotenv() # <-- Load variables from .env file into the environment
 # (This section should come *after* load_dotenv if generate.py also needs env vars,
 # but in this case, only api.py needs the R2 vars directly)
 try:
-    from generate import text_to_speech, process_conversation, AVAILABLE_VOICES, combine_wav_files
+    from generate import text_to_speech, process_conversation_async, AVAILABLE_VOICES
 except ImportError:
     print("Error: Could not import functions from generate.py. Make sure it's in the same directory or Python path.")
     # Assign defaults or raise error to prevent app start?
     AVAILABLE_VOICES = []
     async def text_to_speech(*args, **kwargs): raise NotImplementedError("TTS function not loaded")
-    async def process_conversation(*args, **kwargs): raise NotImplementedError("Conversation function not loaded")
+    async def process_conversation_async(*args, **kwargs): raise NotImplementedError("Async Conversation function not loaded")
 
 
 app = FastAPI(title="Orpheus TTS API", version="0.1.0")
@@ -122,35 +124,32 @@ async def upload_to_r2(local_file_path: str, object_key: str) -> Optional[str]:
 
     try:
         print(f"Uploading {local_file_path} to R2 bucket '{R2_BUCKET_NAME}' as '{object_key}'...")
-        r2_client.upload_file(
+        await asyncio.to_thread(
+            r2_client.upload_file,
             local_file_path,
             R2_BUCKET_NAME,
             object_key,
-            ExtraArgs={'ContentType': 'audio/wav', 'ACL': 'public-read'} # Ensure public read ACL
+            ExtraArgs={'ContentType': 'audio/wav', 'ACL': 'public-read'}
         )
         print("Upload successful.")
 
         # Construct the public URL
         if R2_PUBLIC_URL_BASE:
-             # Ensure no double slashes if base URL already has one at the end
              public_url = f"{R2_PUBLIC_URL_BASE.rstrip('/')}/{object_key.lstrip('/')}"
         else:
-             # Attempt to construct default URL (less reliable, needs public bucket access)
-             print("Warning: R2_PUBLIC_URL_BASE not set. Attempting default URL construction (requires public bucket).")
+             print("Warning: R2_PUBLIC_URL_BASE not set. Attempting default URL construction.")
              try:
                   endpoint_parts = R2_ENDPOINT_URL.split('.')
                   if len(endpoint_parts) > 2 and '//' in endpoint_parts[0]:
                        account_id = endpoint_parts[0].split('//')[1]
-                       # Using pub-<hash>.r2.dev format (common for public R2 buckets)
-                       # This requires enabling the public bucket URL feature in Cloudflare R2 settings
-                       public_url_base = f"https://pub-{R2_ENDPOINT_URL.split('.')[0].split('-')[1]}.r2.dev" # Heuristic, might need adjustment
+                       public_url_base = f"https://pub-{R2_ENDPOINT_URL.split('.')[0].split('-')[1]}.r2.dev"
                        public_url = f"{public_url_base}/{object_key}"
-                       print(f"Constructed default URL: {public_url}. Ensure bucket public access is enabled at this base URL.")
+                       print(f"Constructed default URL: {public_url}. Ensure public access enabled.")
                   else:
-                       print("Warning: Could not parse account ID from endpoint URL. Cannot construct default public URL.")
+                       print("Warning: Could not parse account ID from endpoint URL.")
                        public_url = None
              except Exception as e:
-                  print(f"Warning: Failed to parse endpoint URL or construct default public URL: {e}")
+                  print(f"Warning: Failed to construct default public URL: {e}")
                   public_url = None
 
         return public_url
@@ -162,9 +161,8 @@ async def upload_to_r2(local_file_path: str, object_key: str) -> Optional[str]:
         print("Error: R2 credentials not found by boto3.")
         return None
     except ClientError as e:
-        # Check for permission errors specifically
         if e.response['Error']['Code'] == 'AccessDenied':
-             print(f"Error uploading to R2: Access Denied. Check bucket permissions and credentials.")
+             print(f"Error uploading to R2: Access Denied.")
         else:
              print(f"Error uploading to R2: {e}")
         return None
@@ -173,6 +171,17 @@ async def upload_to_r2(local_file_path: str, object_key: str) -> Optional[str]:
         return None
 # --- END R2 UPLOAD FUNCTION ---
 
+# --- NEW: Synchronous SSE Formatter ---
+def format_sse(data: dict) -> str:
+    """Formats a dictionary into an SSE message string."""
+    if not isinstance(data, dict):
+        print(f"Warning: Invalid data type passed to format_sse: {type(data)}")
+        data = {"status": "internal_warning", "message": "Invalid event data type"}
+    # Ensure status exists if only message provided (optional enhancement)
+    # if "status" not in data and "message" in data:
+    #     data["status"] = "progress"
+    return f"data: {json.dumps(data)}\n\n"
+# --- END Formatter ---
 
 # --- API Endpoints ---
 
@@ -260,111 +269,146 @@ async def generate_single_tts(
 
 
 @app.post(
-    "/generate-conversation",
+    "/generate-conversation-stream",
     tags=["TTS"],
-    summary="Generate conversation audio, upload to R2, and return URL",
-    response_model=ConversationUrlResponse,
+    summary="Generate conversation audio, upload to R2, and stream progress",
+    # Response model is not directly applicable here as it's a stream
     responses={
-        200: {"description": "Successful. Returns JSON with the audio URL or local path info."},
+        200: {"description": "SSE stream started. Events contain progress and final URL/error."},
         400: {"model": ErrorResponse, "description": "Invalid input"},
-        500: {"model": ErrorResponse, "description": "Internal server error"},
-        501: {"model": ErrorResponse, "description": "Functionality not loaded or R2 not configured"},
+        501: {"model": ErrorResponse, "description": "Functionality not loaded or R2 not configured initially"},
      }
 )
-async def generate_conversation_r2(
-    request: ConversationRequest,
-):
+async def generate_conversation_stream(request_data: ConversationRequest): # Use the Pydantic model for validation
     """
-    Generates conversation audio, uploads it to Cloudflare R2 (if configured)
-    within a nested timestamped folder structure (audio/output_YYYY-MM-DDTHH-MM-SS-msZ/),
-    and returns the public URL.
+    Starts a Server-Sent Events (SSE) stream to report progress on
+    generating conversation audio and uploading it to Cloudflare R2.
 
-    - **conversation**: List of objects with `text`, `voice`, `pause_after`.
-    - **output_filename_base**: Base name for the audio file itself.
+    Events are JSON strings containing `status` and optional `message`, `progress`,
+    `audio_url`, `r2_object_key`, `local_path`.
+
+    Example Event: `data: {"status": "progress", "message": "Generated segment 1/10"}\n\n`
+    Final Event: `data: {"status": "success", "audio_url": "...", ...}\n\n` or `data: {"status": "error", ...}\n\n`
     """
-    if not callable(process_conversation):
-        raise HTTPException(status_code=501, detail="Conversation processing function not available.")
 
-    for i, line in enumerate(request.conversation):
-        if line.voice not in AVAILABLE_VOICES:
-            raise HTTPException(status_code=400, detail=f"Voice '{line.voice}' for line {i+1} not available.")
+    # Define the async generator for SSE events
+    async def event_generator() -> AsyncGenerator[str, None]:
+        generated_local_path: Optional[str] = None
+        request_temp_dir: Optional[str] = None
+        r2_full_object_key: Optional[str] = None
+        final_result_data: Dict[str, Any] = {} # To store final data for the last event
 
-    local_filename_base = request.output_filename_base
-    local_audio_filename = generate_safe_filename(local_filename_base)
-    local_combined_filepath = os.path.join(API_OUTPUT_DIR, local_audio_filename)
-    request_temp_dir = os.path.join(API_TEMP_DIR, str(uuid.uuid4()))
+        # Use the synchronous formatter now
+        yield format_sse({"status": "start", "message": "Starting process..."})
+        await asyncio.sleep(0.01)
 
-    conversation_data_for_processing = [
-        {"text": line.text, "voice": line.voice, "pause_after": line.pause_after}
-        for line in request.conversation
-    ]
+        try:
+            # --- 1. Validation ---
+            yield format_sse({"status": "validation", "message": "Validating voices..."})
+            if not callable(process_conversation_async):
+                 raise ValueError("Async conversation processing function not available.")
+            for i, line in enumerate(request_data.conversation):
+                if line.voice not in AVAILABLE_VOICES:
+                    raise HTTPException(status_code=400, detail=f"Invalid voice '{line.voice}' for line {i+1}.")
+            yield format_sse({"status": "validation", "message": "Validation complete."})
+            await asyncio.sleep(0.01)
 
-    generated_local_path: Optional[str] = None
-    r2_full_object_key: Optional[str] = None
+            # --- 2. Prepare ---
+            local_filename_base = request_data.output_filename_base
+            local_audio_filename = generate_safe_filename(local_filename_base)
+            local_combined_filepath = os.path.join(API_OUTPUT_DIR, local_audio_filename)
+            request_temp_dir = os.path.join(API_TEMP_DIR, str(uuid.uuid4()))
+            conversation_data_for_processing = [{"text": l.text, "voice": l.voice, "pause_after": l.pause_after} for l in request_data.conversation]
 
-    try:
-        print(f"API generating conversation locally, target: {local_combined_filepath}, temp dir: {request_temp_dir}")
-        generated_local_path = process_conversation(
-            conversation_data=conversation_data_for_processing,
-            combined_filename=local_combined_filepath,
-            intermediate_dir=request_temp_dir
-        )
+            yield format_sse({"status": "generation_start", "message": f"Starting generation..."})
+            await asyncio.sleep(0.01)
 
-        if not generated_local_path or not os.path.exists(generated_local_path):
-             print(f"Local conversation generation failed or file not found: {local_combined_filepath}")
-             raise HTTPException(status_code=500, detail="Local conversation generation failed.")
+            # --- 3. Run Async Local Generation & Stream Progress ---
+            # This generator yields progress updates AND a final result dict
+            process_gen = process_conversation_async(
+                conversation_data_for_processing,
+                local_combined_filepath,
+                request_temp_dir
+            )
+            async for event_data in process_gen:
+                 # Check if this is the final result dict from the generator
+                 if event_data.get("type") == "result":
+                     generator_status = event_data.get("status", "error") # Get status (finished, error, etc.)
+                     generated_local_path = event_data.get("path") # Get the final path (or None)
+                     print(f"Generator finished with status: {generator_status}, path: {generated_local_path}")
+                     if generator_status == "error" or not generated_local_path:
+                          # If the generator itself reported a critical failure or no path
+                          final_result_data = {
+                               "status": "error",
+                               "message": event_data.get("message", "Generation process failed internally.")
+                          }
+                     # Break loop, handle upload/final result below
+                     break
+                 else:
+                     # Forward progress/warning events directly to the client
+                     yield format_sse(event_data) # Use formatter
+                     await asyncio.sleep(0.01)
 
-        print(f"Local conversation generation successful: {generated_local_path}")
+            # --- Check if generation was successful (path exists) ---
+            if not generated_local_path:
+                 # If we broke the loop but still have no path, use the stored error or a default
+                 if not final_result_data: # Check if error wasn't already set
+                     final_result_data = {
+                          "status": "error",
+                          "message": "Local conversation generation failed (no output path)."
+                     }
+                 # Skip upload and proceed to sending the final (error) event
 
-        if r2_client:
-            now_utc = datetime.now(timezone.utc)
-            timestamp_folder = now_utc.strftime("output_%Y-%m-%dT%H-%M-%S-%f")[:-3] + "Z"
-            audio_file_basename = os.path.basename(generated_local_path)
+            # --- 4. Upload to R2 (only if generation succeeded) ---
+            elif r2_client: # Check if R2 is configured AND generation was ok
+                yield format_sse({"status": "upload_start", "message": "Starting R2 upload..."})
+                await asyncio.sleep(0.01)
+                now_utc = datetime.now(timezone.utc)
+                timestamp_folder = now_utc.strftime("output_%Y-%m-%dT%H-%M-%S-%f")[:-3] + "Z"
+                audio_file_basename = os.path.basename(generated_local_path)
+                r2_full_object_key = f"audio/{timestamp_folder}/{audio_file_basename}"
 
-            r2_full_object_key = f"audio/{timestamp_folder}/{audio_file_basename}"
+                audio_url = await upload_to_r2(generated_local_path, r2_full_object_key)
 
-            print(f"Attempting upload to R2 with key: {r2_full_object_key}") # Log the key being used
-            audio_url = await upload_to_r2(generated_local_path, r2_full_object_key)
+                if audio_url:
+                    yield format_sse({"status": "upload_complete", "message": "R2 upload successful."})
+                    asyncio.create_task(cleanup_file(generated_local_path)) # Cleanup local file async
+                    final_result_data = {
+                        "status": "success",
+                        "message": "Conversation generated and uploaded successfully.",
+                        "audio_url": audio_url,
+                        "r2_object_key": r2_full_object_key
+                    }
+                else: # Upload failed
+                    final_result_data = {
+                        "status": "error", # Treat upload failure as overall error for this endpoint's goal
+                        "message": "Conversation generated locally, but R2 upload failed.",
+                        "local_path": generated_local_path, # Keep local file
+                        "r2_object_key": r2_full_object_key
+                    }
+            elif generated_local_path: # Generation succeeded, but R2 not configured
+                final_result_data = {
+                    "status": "success_local",
+                    "message": "Conversation generated locally. R2 upload skipped (not configured).",
+                    "local_path": generated_local_path # Keep local file
+                }
 
-            if audio_url:
-                await cleanup_file(generated_local_path)
-                return JSONResponse(content={
-                    "message": "Conversation generated and uploaded to R2 successfully.",
-                    "audio_url": audio_url,
-                    "r2_object_key": r2_full_object_key
-                })
-            else:
-                 return JSONResponse(status_code=500, content={
-                    "message": "Conversation generated locally, but R2 upload failed.",
-                    "audio_url": None,
-                    "local_path": generated_local_path,
-                    "r2_object_key": r2_full_object_key
-                 })
-        else:
-            # R2 not configured
-            print("R2 not configured. Returning local path info.")
-            return JSONResponse(status_code=200, content={ # 200 OK, but indicate skip
-                "message": "Conversation generated locally. R2 upload skipped (not configured).",
-                "audio_url": None,
-                "local_path": generated_local_path
-            })
+            # --- Send Final Result Event ---
+            if final_result_data: # Ensure we have something to send
+                 yield format_sse(final_result_data)
+            else: # Should not happen if logic is correct, but as a fallback
+                 yield format_sse({"status": "error", "message": "Processing ended in an unexpected state."})
 
-    except HTTPException as e:
-        if generated_local_path and os.path.exists(generated_local_path):
-             await cleanup_file(generated_local_path)
-        if os.path.exists(request_temp_dir):
-             try: shutil.rmtree(request_temp_dir)
-             except OSError: pass
-        raise e
-    except Exception as e:
-        if generated_local_path and os.path.exists(generated_local_path):
-            await cleanup_file(generated_local_path)
-        if os.path.exists(request_temp_dir):
-             try: shutil.rmtree(request_temp_dir)
-             except OSError: pass
-        print(f"Error during conversation generation/upload: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
+        except HTTPException as e: # Catch validation errors
+             yield format_sse({"status": "error", "message": f"Input Error: {e.detail}"})
+        except Exception as e: # Catch other unexpected errors
+             print(f"Error during conversation stream: {e}", exc_info=True)
+             yield format_sse({"status": "error", "message": f"An internal server error occurred: {str(e)}"})
+        # Note: Cleanup of request_temp_dir is handled within process_conversation_async
+
+    # Return the StreamingResponse
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 # --- Run the API (for local testing) ---
 if __name__ == "__main__":

@@ -2,3 +2,7 @@ __pycache__
 outputs/
 venv/
 .DS_Store
+
+.env
+api_output/
+results/
