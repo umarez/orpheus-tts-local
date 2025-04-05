@@ -33,6 +33,8 @@ START_TOKEN_ID = 128259
 END_TOKEN_IDS = [128009, 128260, 128261, 128257]
 CUSTOM_TOKEN_PREFIX = "<custom_token_"
 
+from decoder import convert_to_audio as orpheus_convert_to_audio
+
 def format_prompt(prompt, voice=DEFAULT_VOICE):
     """Format prompt for Orpheus model with voice prefix and special tokens."""
     if voice not in AVAILABLE_VOICES:
@@ -123,8 +125,6 @@ def turn_token_into_id(token_string, index):
 
 def convert_to_audio(multiframe, count):
     """Convert token frames to audio."""
-    # Import here to avoid circular imports
-    from decoder import convert_to_audio as orpheus_convert_to_audio
     return orpheus_convert_to_audio(multiframe, count)
 
 async def tokens_decoder(token_gen):
