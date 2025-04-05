@@ -18,7 +18,7 @@ HEADERS = {
 }
 
 # Model parameters
-MAX_TOKENS = 1200
+MAX_TOKENS = 100000
 TEMPERATURE = 0.6
 TOP_P = 0.9
 REPETITION_PENALTY = 1.1
@@ -282,7 +282,7 @@ def main():
     
     # Generate speech
     start_time = time.time()
-    audio_segments = generate_speech_from_api(
+    generate_speech_from_api(
         prompt=prompt,
         voice=args.voice,
         temperature=args.temperature,
